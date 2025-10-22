@@ -9,4 +9,3 @@ beautifulsoup4
 PyYAML
 markdownify
 openai>=1.30.0
-tiktoken
