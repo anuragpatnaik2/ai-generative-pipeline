@@ -2,6 +2,11 @@ fastapi
 uvicorn[standard]
 boto3
 pydantic
-langgraph
 httpx
 python-dotenv
+feedparser
+beautifulsoup4
+PyYAML
+markdownify
+openai>=1.30.0
+tiktoken
