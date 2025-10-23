@@ -42,6 +42,7 @@ async def run_daily(authorization: Optional[str] = Header(None)):
 
 
 @app.post("/resume")  # Slack Interactivity Request URL
+
 async def resume(request: Request):
     """
     Slack calls this on button clicks & modal submits.
@@ -53,6 +54,16 @@ async def resume(request: Request):
         # Let Slack save the URL during initial verification.
         return {"ok": True}
 
+   # TEMPORARY BYPASS FOR DEBUG:
+    if os.getenv("SLACK_VERIFY", "on").lower() == "off":
+        pass
+    else:
+        try:
+            slk.verify_signature(request.headers, raw)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Slack verify failed: {e}")
+	
+	
     # Verify Slack signature if our helper is available
     if slk is None:
         # Fail-safe: allow during setup; tighten once slk.verify_signature is present.
