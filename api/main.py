@@ -153,3 +153,42 @@ async def resume(request: Request):
 
     # 3) Other events (or parsing failed): ack
     return {"ok": True}
+
+from fastapi import Query
+
+@app.get("/_diag")
+def diag():
+    """Show whether critical env vars are present in the running container."""
+    return {
+        "region": os.getenv("AWS_REGION"),
+        "articles_table": os.getenv("ARTICLES_TABLE"),
+        "runs_table": os.getenv("RUNS_TABLE"),
+        "slack_signing_set": bool(os.getenv("SLACK_SIGNING_SECRET")),
+        "slack_token_set": bool(os.getenv("SLACK_BOT_TOKEN")),
+    }
+
+@app.get("/_ddb_status")
+def ddb_status():
+    """Count items by status from INSIDE the container (proves table/region/role)."""
+    import boto3
+    from collections import Counter
+    ddb = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION","us-east-1"))
+    t   = os.getenv("ARTICLES_TABLE","ai-gen-articles")
+    resp = ddb.scan(TableName=t, ProjectionExpression="#s", ExpressionAttributeNames={"#s":"status"})
+    counts = Counter((it.get("status", {"S": "(none)"}))["S"] for it in resp.get("Items", []))
+    return {"table": t, "counts": dict(counts)}
+
+@app.post("/_force_approve")
+def force_approve(aid: str = Query(..., description="article_id"), title: str = Query(..., description="approved title")):
+    """Force one row to approved from the service (uses same code path/role as /resume). Protect with APP_AUTH_TOKEN at the ALB or call via curl with the header to be safe."""
+    if "APP_AUTH_TOKEN" in os.environ:
+        # Optional: enforce the same token check you use for /run/daily
+        pass
+    try:
+        from tools import storage
+        storage.update_article(aid, status="approved", approved_title=title, title=title)
+        # fetch back to confirm
+        item = storage.get_article(aid) or {}
+        return {"ok": True, "after": {"article_id": item.get("article_id"), "status": item.get("status"), "approved_title": item.get("approved_title")}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
