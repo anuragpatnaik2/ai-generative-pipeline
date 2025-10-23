@@ -179,16 +179,39 @@ def ddb_status():
     return {"table": t, "counts": dict(counts)}
 
 @app.post("/_force_approve")
-def force_approve(aid: str = Query(..., description="article_id"), title: str = Query(..., description="approved title")):
-    """Force one row to approved from the service (uses same code path/role as /resume). Protect with APP_AUTH_TOKEN at the ALB or call via curl with the header to be safe."""
-    if "APP_AUTH_TOKEN" in os.environ:
-        # Optional: enforce the same token check you use for /run/daily
-        pass
+def force_approve(aid: str = Query(..., description="article_id"),
+                  title: str = Query(..., description="approved title")):
+    """
+    Force one row to approved from inside the running service using boto3 directly.
+    This proves table/region/role/write access independent of tools.storage.
+    """
+    import os, datetime
+    import boto3
+    ddb   = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    table = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+    now   = datetime.datetime.utcnow().replace(microsecond=False).isoformat() + "Z"
+
     try:
-        from tools import storage
-        storage.update_article(aid, status="approved", approved_title=title, title=title)
-        # fetch back to confirm
-        item = storage.get_article(aid) or {}
-        return {"ok": True, "after": {"article_id": item.get("article_id"), "status": item.get("status"), "approved_title": item.get("approved_title")}}
+        ddb.update_item(
+            TableName=table,
+            Key={"article_id": {"S": aid}},
+            UpdateExpression="SET #s = :s, approved_title = :t, #t = :t, updated_at = :u",
+            ExpressionAttributeNames={"#s": "status", "#t": "title"},
+            ExpressionAttributeValues={
+                ":s": {"S": "approved"},
+                ":t": {"S": title},
+                ":u": {"S": now},
+            },
+        )
+        got = ddb.get_item(TableName=table, Key={"article_id": {"S": aid}}).get("Item", {})
+        return {
+            "ok": True,
+            "after": {
+                "article_id": got.get("article_id", {}).get("S"),
+                "status":      got.get("status", {}).get("S"),
+                "approved_title": got.get("approved_title", {}).get("S"),
+                "title":          got.get("title", {}).get("S"),
+            },
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
