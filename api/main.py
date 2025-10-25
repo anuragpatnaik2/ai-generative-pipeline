@@ -43,38 +43,26 @@ async def run_daily(authorization: Optional[str] = Header(None)):
 
 @app.post("/resume")  # Slack Interactivity Request URL
 
+# --- BEGIN /resume (drop-in replacement) ---
+from fastapi import HTTPException, Request
+import os, json, boto3
+
+@app.post("/resume")  # Slack interactivity hits here
 async def resume(request: Request):
-    """
-    Slack calls this on button clicks & modal submits.
-    Slack also pings this URL when you first save it in the app config; that ping
-    may have an empty body. We must return 200 quickly in that case.
-    """
     raw = await request.body()
+
+    # Slack's initial "save URL" ping can be an empty body — allow it.
     if not raw:
-        # Let Slack save the URL during initial verification.
         return {"ok": True}
 
-   # TEMPORARY BYPASS FOR DEBUG:
-    if os.getenv("SLACK_VERIFY", "on").lower() == "off":
-        pass
-    else:
-        try:
-            slk.verify_signature(request.headers, raw)
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Slack verify failed: {e}")
-	
-	
-    # Verify Slack signature if our helper is available
-    if slk is None:
-        # Fail-safe: allow during setup; tighten once slk.verify_signature is present.
-        pass
-    else:
+    # Verify Slack signature unless you've explicitly disabled it via SLACK_VERIFY=off
+    if os.getenv("SLACK_VERIFY", "on").lower() == "on":
         try:
             slk.verify_signature(request.headers, raw)
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Slack verify failed: {e}")
 
-    # Parse the interactive payload
+    # Parse payload
     try:
         form = await request.form()
         payload = json.loads(form.get("payload", "{}"))
@@ -83,76 +71,122 @@ async def resume(request: Request):
 
     ptype = payload.get("type")
 
-    # 1) Button clicks (block_actions)
+    # ====== BUTTON CLICKS ======
     if ptype == "block_actions":
         actions = payload.get("actions") or []
-        action = actions[0] if actions else {}
+        action  = actions[0] if actions else {}
+
+        # Try to parse the embedded JSON value first (what we set in the button)
         try:
             data = json.loads(action.get("value", "{}"))
         except Exception:
             data = {}
 
-        # Edit → open modal
-        if data.get("action") == "edit":
-            if slk is None or storage is None:
-                return {"response_action": "clear"}
-            trigger_id = payload.get("trigger_id")
-            art_id = data.get("article_id", "")
-            a = (storage.get_article(art_id) if storage else {}) or {}
-            current = a.get("title", "")
-            await slk.open_edit_modal(trigger_id, art_id, current)
-            return {"response_action": "clear"}  # acknowledge
+        # Fallback: derive the choice from action_id if value is missing
+        action_id = (action.get("action_id") or "").lower()
+        if "choice" not in data:
+            if action_id.endswith("_a"):
+                data["choice"] = "A"
+            elif action_id.endswith("_b"):
+                data["choice"] = "B"
+            elif action_id.endswith("_c"):
+                data["choice"] = "C"
 
-        # Approve A/B/C
+        # EDIT: open modal
+        if data.get("action") == "edit":
+            trigger_id = payload.get("trigger_id")
+            art_id     = data.get("article_id", "")
+            a = storage.get_article(art_id) if storage else {}
+            current = (a or {}).get("title", "")
+            await slk.open_edit_modal(trigger_id, art_id, current)
+            return {"response_action": "clear"}
+
+        # APPROVE: flip status + approved_title directly in DynamoDB
         if data.get("action") == "approve":
-            if storage is None:
-                return {"text": "Storage not available"}
-            art_id = data.get("article_id", "")
-            a = storage.get_article(art_id)
-            if not a:
+            art_id = data.get("article_id")
+            choice = data.get("choice") or "A"
+
+            if not art_id:
+                return {"text": "Unable to identify article_id from action."}
+
+            # Fetch item
+            ddb   = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION", "us-east-1"))
+            table = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+            got   = ddb.get_item(TableName=table, Key={"article_id": {"S": art_id}}).get("Item")
+
+            if not got:
                 return {"text": "Article not found."}
-            titles = (a.get("proposed_titles") or []) + ["", "", ""]
-            idx = {"A": 0, "B": 1, "C": 2}.get(data.get("choice", "A"), 0)
-            approved = titles[idx][:60]
-            storage.update_article(
-                art_id,
-                approved_title=approved,
-                title=approved,
-                status="approved",
+
+            # Unmarshall a few fields
+            def _S(item, key, default=""):
+                v = item.get(key)
+                return v.get("S") if isinstance(v, dict) and "S" in v else default
+
+            def _L(item, key):
+                v = item.get(key)
+                if isinstance(v, dict) and "L" in v:
+                    return [x.get("S") for x in v["L"] if isinstance(x, dict) and "S" in x]
+                return []
+
+            proposed      = _L(got, "proposed_titles")
+            current_title = _S(got, "title", "")
+            idx_map       = {"A": 0, "B": 1, "C": 2}
+            idx           = idx_map.get(choice, 0)
+
+            if proposed and 0 <= idx < len(proposed) and proposed[idx]:
+                approved = proposed[idx][:60]
+            else:
+                approved = (current_title or "Approved Title")[:60]
+
+            # Persist update: status -> approved, set titles
+            ddb.update_item(
+                TableName=table,
+                Key={"article_id": {"S": art_id}},
+                UpdateExpression="SET #s = :s, approved_title = :t, #t = :t",
+                ExpressionAttributeNames={"#s": "status", "#t": "title"},
+                ExpressionAttributeValues={
+                    ":s": {"S": "approved"},
+                    ":t": {"S": approved},
+                },
             )
             return {"text": f"✅ Approved: {approved}"}
 
-        # Regenerate requested
+        # REGENERATE requested (just mark a flag; your follow-up job can refresh proposed_titles)
         if data.get("action") == "regen":
-            if storage is None:
-                return {"text": "Regenerate requested (storage not available)."}
-            art_id = data.get("article_id", "")
-            storage.update_article(
-                art_id,
-                status="awaiting_approval",
-                needs_regen=True
-            )
+            art_id = data.get("article_id")
+            if art_id and storage:
+                storage.update_article(art_id, status="awaiting_approval", needs_regen=True)
             return {"text": "🔁 Will regenerate titles soon."}
 
-        # Unhandled
+        # Unhandled action
         return {"text": "Unhandled action"}
 
-    # 2) Modal submission (view_submission)
+    # ====== MODAL SUBMIT (Edit Title) ======
     if ptype == "view_submission" and payload.get("view", {}).get("callback_id") == "edit_submit":
-        if storage is None:
-            return {"response_action": "clear"}
         try:
             pm = json.loads(payload["view"].get("private_metadata", "{}"))
-            new_title = payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"].strip()[:60]
             art_id = pm.get("article_id", "")
-            storage.update_article(art_id, approved_title=new_title, title=new_title, status="approved")
+            new_title = payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"].strip()[:60]
+
+            # Update via DynamoDB directly (works whether or not storage helper exists)
+            ddb   = boto3.client("dynamodb", region_name=os.getenv("AWS_REGION", "us-east-1"))
+            table = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+            ddb.update_item(
+                TableName=table,
+                Key={"article_id": {"S": art_id}},
+                UpdateExpression="SET #s = :s, approved_title = :t, #t = :t",
+                ExpressionAttributeNames={"#s": "status", "#t": "title"},
+                ExpressionAttributeValues={":s": {"S": "approved"}, ":t": {"S": new_title}},
+            )
         except Exception:
             # Always ack so Slack isn't unhappy; log in real app.
             return {"response_action": "clear"}
         return {"response_action": "clear"}
 
-    # 3) Other events (or parsing failed): ack
+    # Default ack
     return {"ok": True}
+# --- END /resume ---
+
 
 from fastapi import Query
 
