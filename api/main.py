@@ -27,6 +27,28 @@ def _check_auth(auth: Optional[str], token_env: str = "APP_AUTH_TOKEN") -> None:
     if auth.split(" ", 1)[1] != tok:
         raise HTTPException(status_code=403, detail="Invalid token")
 
+
+import re, json  # already present, but ensure imported
+
+def _clean_title(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    t = s.strip()
+    # strip Markdown code fences like ```json … ```
+    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    # if the model returned a JSON array like ["Title", "Alt"], take the first element
+    try:
+        parsed = json.loads(t)
+        if isinstance(parsed, list) and parsed:
+            t = str(parsed[0])
+    except Exception:
+        pass
+    # drop stray quotes/backticks and collapse whitespace
+    t = t.strip().strip('"\''"").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t[:60]
+
 @app.get("/")
 def root():
     return {"ok": True}
@@ -158,9 +180,11 @@ async def resume(request: Request):
                 idx_map = {"A": 0, "B": 1, "C": 2}
                 idx = idx_map.get(choice, 0)
                 base_title = _S(item, "title")
-                new_title = (titles[idx] if idx < len(titles) and titles[idx] else base_title).strip()[:60]
-                if not new_title:
-                    new_title = "Approved title"
+                raw_title = titles[idx] if idx < len(titles) else _S(item, "title")
+		new_title = _clean_title(raw_title)
+		if not new_title:
+    			new_title = "Approved title"
+
 
                 print(f"[resume] updating {art_id} → '{new_title}' (table {table})")
                 ddb.update_item(
