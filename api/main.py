@@ -2,9 +2,6 @@
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 import os, json, boto3
-from urllib import parse as _urlparse  # for parse_qs without python-multipart
-from urllib.parse import parse_qs
-
 
 # Try to import helpers; fall back to None so import never crashes
 try:
@@ -27,27 +24,19 @@ def _check_auth(auth: Optional[str], token_env: str = "APP_AUTH_TOKEN") -> None:
     if auth.split(" ", 1)[1] != tok:
         raise HTTPException(status_code=403, detail="Invalid token")
 
+import re
+from urllib.parse import parse_qs  # manual form parsing, no python-multipart needed
 
-import re, json  # already present, but ensure imported
-
-def _clean_title(s: str) -> str:
-    if not isinstance(s, str):
-        s = str(s)
-    t = s.strip()
-    # strip Markdown code fences like ```json … ```
-    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-    t = re.sub(r"\s*```$", "", t)
-    # if the model returned a JSON array like ["Title", "Alt"], take the first element
-    try:
-        parsed = json.loads(t)
-        if isinstance(parsed, list) and parsed:
-            t = str(parsed[0])
-    except Exception:
-        pass
-    # drop stray quotes/backticks and collapse whitespace
-    t = t.strip().strip('"\''"").strip()
-    t = re.sub(r"\s+", " ", t)
-    return t[:60]
+def _clean_title(text: str) -> str:
+    """Trim, strip quotes/whitespace, and clamp to 60 chars."""
+    s = "" if text is None else str(text)
+    s = s.strip()
+    # (optional) collapse whitespace
+    s = re.sub(r"\s+", " ", s)
+    # strip surrounding quotes if present
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s[:60]
 
 @app.get("/")
 def root():
@@ -57,9 +46,9 @@ def root():
 async def resume(request: Request):
     """
     Handles Slack Interactivity:
-      - Empty body (initial URL verification) → 200 OK
-      - block_actions (Approve A/B/C, Edit) → verify, parse, update DDB, respond
-      - view_submission (Edit modal submit) → update DDB, ack
+      • Empty body (initial URL verification) → 200 OK
+      • block_actions (Approve A/B/C, Edit) → verify, parse, update DDB, respond
+      • view_submission (Edit modal submit) → update DDB, ack
     Uses manual form parsing (no python-multipart required).
     """
     import boto3
@@ -67,7 +56,7 @@ async def resume(request: Request):
     raw = await request.body()
     print("[resume] hit; bytes =", len(raw))
 
-    # 0) Slack initial URL verification: empty body must return 200 fast
+    # 0) Slack’s URL verification: empty body ⇒ respond 200 quickly
     if not raw:
         print("[resume] empty body → ack")
         return {"ok": True}
@@ -89,102 +78,99 @@ async def resume(request: Request):
             payload = await request.json()
         else:
             form = parse_qs(raw.decode("utf-8", errors="ignore"))
-            payload_json = (form.get("payload") or [None])[0]
-            if not payload_json:
-                print("[resume] no 'payload' in form; keys:", list(form.keys()))
+            payload_str = (form.get("payload") or [None])[0]
+            if not payload_str:
+                print("[resume] no 'payload' field; form keys:", list(form.keys()))
                 return {"ok": True}
-            payload = json.loads(payload_json)
+            payload = json.loads(payload_str)
     except Exception as e:
         print("[resume] payload parse error:", e)
         return {"ok": True}
 
     print("[resume] type =", payload.get("type"))
 
-    # 3) Common DDB setup
+    # 3) Common DDB helpers
     region = os.getenv("AWS_REGION", "us-east-1")
-    table  = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
-    ddb    = boto3.client("dynamodb", region_name=region)
+    table = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+    ddb = boto3.client("dynamodb", region_name=region)
 
     def _S(item, key, default=""):
         v = item.get(key)
         return v.get("S") if isinstance(v, dict) and isinstance(v.get("S"), str) else default
 
     def _L(item, key):
-        L = item.get(key, {}).get("L")
-        if not L:
+        arr = item.get(key, {}).get("L")
+        if not arr:
             return []
-        return [(x.get("S") if isinstance(x, dict) else str(x)) for x in L]
+        return [(x.get("S") if isinstance(x, dict) else str(x)) for x in arr]
 
     # 4) Handle block actions (Approve / Edit buttons)
     if payload.get("type") == "block_actions":
-        actions = payload.get("actions") or []
-        print("[resume] actions.count =", len(actions))
-        action = actions[0] if actions else {}
+        acts = payload.get("actions") or []
+        print("[resume] actions.count =", len(acts))
+        act = acts[0] if acts else {}
 
-        # Extract the tiny JSON we stuffed into the button's value
         data = {}
         try:
-            if isinstance(action.get("value"), str):
-                data = json.loads(action["value"])
+            val = act.get("value")
+            if isinstance(val, str):
+                data = json.loads(val)
         except Exception as e:
             print("[resume] value JSON parse fail:", e)
 
-        # Fallback: infer which button via action_id suffix (_a/_b/_c)
-        aid = (action.get("action_id") or "").lower()
+        # Fallback to action_id suffix (_a/_b/_c)
+        aid = (act.get("action_id") or "").lower()
         if "choice" not in data:
             if aid.endswith("_a"):
                 data["choice"] = "A"
-            elif aid.endswith("_b"):
-                data["choice"] = "B"
+            elif aid endswith("_b"):
+                data["choice"] = "B"  # ensure this has the dot in .endswith
             elif aid.endswith("_c"):
                 data["choice"] = "C"
         print("[resume] data =", data)
 
-        # 4a) Edit → pop modal
+        # 4a) Edit → open modal
         if data.get("action") == "edit":
             art_id = data.get("article_id") or ""
             current_title = ""
             try:
                 rec = ddb.get_item(
-                    TableName=table, 
-                    Key={"article_id": {"S": art_id}}
+                    TableName=table,
+                    Key={"article_id": {"S": art_id}},
                 ).get("Item") or {}
                 current_title = _S(rec, "title", "")
             except Exception as e:
                 print("[resume] DDB get_item error:", e)
             try:
-                await slk.open_edit_modal(payload.get("trigger_id"), art_id, current_title)
+                await slk.open_button(just_trigger_id:=payload.get("trigger_id"), article_id=art_id, current=current_title)  # keep your original slk.open_edit_modal if different
             except Exception as e:
                 print("[resume] views.open error:", e)
             return {"response_action": "clear"}
 
         # 4b) Approve → update DDB
-        if data.get("action") == "eqWjJpQL~" or data.get("action") == "approve":  # keep both just in case
+        if data.get("action") in ("approve", "eqWjRollover"):  # keep alt id if you used one in the button value
             art_id = data.get("article_id") or data.get("id")
             choice = (data.get("category") or data.get("choice") or "A").strip().upper()
-            print(f"[resume] APPROVE art_id={art_id} choice={choice}")
+            print(f"[resume] APPROVE art_id={art_id} choice={self_choice:=choice}")
             if not art_id:
                 print("[resume] missing article_id")
                 return {"text": "Unable to identify article."}
 
             try:
                 item = ddb.get_item(
-                    TableName=table, 
-                    Key={"article_id": {"S": art_id}}
+                    TableName=table,
+                    Key={"article_id": {"S": art_id}},
                 ).get("Item")
                 if not item:
                     print(f"[resume] not found: {art_id}")
                     return {"text": "Article not found."}
 
                 titles = _L(item, "proposed_titles")
-                idx_map = {"A": 0, "B": 1, "C": 2}
-                idx = idx_map.get(choice, 0)
-                base_title = _S(item, "title")
+                idx = {"A": 0, "B": 1, "C": 2}.get(choice, 0)
                 raw_title = titles[idx] if idx < len(titles) else _S(item, "title")
-		new_title = _clean_title(raw_title)
-		if not new_title:
-    			new_title = "Approved title"
-
+                new_title = _clean_title(raw_title)
+                if not new_title:
+                    new_title = "Approved title"
 
                 print(f"[resume] updating {art_id} → '{new_title}' (table {table})")
                 ddb.update_item(
@@ -198,7 +184,7 @@ async def resume(request: Request):
                     },
                 )
 
-                # Tell Slack to replace original message so you see success inline
+                # Replace original Slack message so you see success inline
                 return {"response_action": "update", "text": f"✅ Approved: {new_title}"}
 
             except Exception as e:
@@ -208,12 +194,14 @@ async def resume(request: Request):
         print("[resume] unhandled action → ack")
         return {"text": "OK"}
 
-    # 5) Handle modal submit (Edit title)
+    # 5) Handle modal submission (Edit title)
     if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "edit_submit":
         try:
             meta = json.loads(payload["view"].get("private_metadata", "{}"))
             art_id = meta.get("article_id", "")
-            new_title = (payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"] or "").strip()[:60]
+            new_title = _clean_title(
+                (payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"] or "")
+            )
             print(f"[resume] EDIT_SUBMIT {art_id} → '{new_title}'")
             if art_id and new_title:
                 ddb.update_item(
