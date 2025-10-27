@@ -24,44 +24,39 @@ def _check_auth(auth: Optional[str], token_env: str = "APP_AUTH_TOKEN") -> None:
     if auth.split(" ", 1)[1] != tok:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-import re
-from urllib.parse import parse_qs  # manual form parsing, no python-multipart needed
-
-def _clean_title(text: str) -> str:
-    """Trim, strip quotes/whitespace, and clamp to 60 chars."""
-    s = "" if text is None else str(text)
-    s = s.strip()
-    # (optional) collapse whitespace
-    s = re.sub(r"\s+", " ", s)
-    # strip surrounding quotes if present
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        s = s[1:-1].strip()
-    return s[:60]
-
-@app.get("/")
-def root():
-    return {"ok": True}
 
 @app.post("/resume")  # Slack interactivity hits here
 async def resume(request: Request):
     """
-    Handles Slack Interactivity:
-      • Empty body (initial URL verification) → 200 OK
-      • block_actions (Approve A/B/C, Edit) → verify, parse, update DDB, respond
-      • view_submission (Edit modal submit) → update DDB, ack
-    Uses manual form parsing (no python-multipart required).
+    Slack Interactivity handler.
+
+    • Empty body (Slack URL check) → 200 OK quickly.
+    • block_actions (Approve A/B/C, Edit) → verify, parse form, update DDB, respond.
+    • view_submission (Edit modal) → update DDB, ack.
+    Uses manual form parsing (no python-multipart needed).
     """
     import boto3
+    from urllib.parse import parse_qs
+    import re
+
+    # --- local helper: title cleanup (keep it simple for Py3.8) ---
+    def _clean_title(text):
+        s = "" if text is None else str(text)
+        s = s.strip()
+        s = re.sub(r"\s+", " ", s)
+        if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+            s = s[1:-1].strip()
+        return s[:60]
 
     raw = await request.body()
     print("[resume] hit; bytes =", len(raw))
 
-    # 0) Slack’s URL verification: empty body ⇒ respond 200 quickly
+    # 0) Slack URL verification (no body) → ack
     if not raw:
         print("[resume] empty body → ack")
         return {"ok": True}
 
-    # 1) Verify Slack signature unless disabled
+    # 1) Verify Slack signature (unless disabled)
     if os.getenv("SLACK_VERIFY", "on").lower() == "on":
         try:
             slk.verify_signature(request.headers, raw)
@@ -71,7 +66,7 @@ async def resume(request: Request):
     else:
         print("[resume] SLACK_VERIFY=off (skipping signature)")
 
-    # 2) Parse payload (Slack posts application/x-www-form-urlencoded with a single 'payload' field)
+    # 2) Parse incoming payload (Slack posts application/x-www-form-urlencoded with 'payload=')
     try:
         ctype = (request.headers.get("content-type") or "").lower()
         if "application/json" in ctype:
@@ -80,7 +75,7 @@ async def resume(request: Request):
             form = parse_qs(raw.decode("utf-8", errors="ignore"))
             payload_str = (form.get("payload") or [None])[0]
             if not payload_str:
-                print("[resume] no 'payload' field; form keys:", list(form.keys()))
+                print("[resume] no 'payload' in form; keys:", list(form.keys()))
                 return {"ok": True}
             payload = json.loads(payload_str)
     except Exception as e:
@@ -91,8 +86,8 @@ async def resume(request: Request):
 
     # 3) Common DDB helpers
     region = os.getenv("AWS_REGION", "us-east-1")
-    table = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
-    ddb = boto3.client("dynamodb", region_name=region)
+    table  = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+    ddb    = boto3.client("dynamodb", region_name=region)
 
     def _S(item, key, default=""):
         v = item.get(key)
@@ -104,12 +99,13 @@ async def resume(request: Request):
             return []
         return [(x.get("S") if isinstance(x, dict) else str(x)) for x in arr]
 
-    # 4) Handle block actions (Approve / Edit buttons)
+    # 4) Handle block_actions (buttons)
     if payload.get("type") == "block_actions":
         acts = payload.get("actions") or []
         print("[resume] actions.count =", len(acts))
         act = acts[0] if acts else {}
 
+        # Extract our tiny JSON from the button's value
         data = {}
         try:
             val = act.get("value")
@@ -118,13 +114,13 @@ async def resume(request: Request):
         except Exception as e:
             print("[resume] value JSON parse fail:", e)
 
-        # Fallback to action_id suffix (_a/_b/_c)
+        # Fallback to action_id suffix (_a / _b / _c)
         aid = (act.get("action_id") or "").lower()
         if "choice" not in data:
             if aid.endswith("_a"):
                 data["choice"] = "A"
-            elif aid endswith("_b"):
-                data["choice"] = "B"  # ensure this has the dot in .endswith
+            elif aid.endswith("_b"):
+                data["choice"] = "B"       # <-- fixed: with dot in .endswith
             elif aid.endswith("_c"):
                 data["choice"] = "C"
         print("[resume] data =", data)
@@ -142,23 +138,23 @@ async def resume(request: Request):
             except Exception as e:
                 print("[resume] DDB get_item error:", e)
             try:
-                await slk.open_button(just_trigger_id:=payload.get("trigger_id"), article_id=art_id, current=current_title)  # keep your original slk.open_edit_modal if different
+                await slk.open_edit_modal(payload.get("trigger_id"), art_id, current_title)
             except Exception as e:
                 print("[resume] views.open error:", e)
             return {"response_action": "clear"}
 
         # 4b) Approve → update DDB
-        if data.get("action") in ("approve", "eqWjRollover"):  # keep alt id if you used one in the button value
+        if data.get("action") in ("approve", "eqjwr"):  # keep alt id if you used one
             art_id = data.get("article_id") or data.get("id")
             choice = (data.get("category") or data.get("choice") or "A").strip().upper()
-            print(f"[resume] APPROVE art_id={art_id} choice={self_choice:=choice}")
+            print(f"[resume] APPROVE art_id={art_id} choice={choice}")
             if not art_id:
                 print("[resume] missing article_id")
                 return {"text": "Unable to identify article."}
 
             try:
                 item = ddb.get_item(
-                    TableName=table,
+                    TableName=table, 
                     Key={"article_id": {"S": art_id}},
                 ).get("Item")
                 if not item:
