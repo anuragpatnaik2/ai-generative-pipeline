@@ -28,140 +28,151 @@ def _check_auth(auth: Optional[str], token_env: str = "APP_AUTH_TOKEN") -> None:
 def root():
     return {"ok": True}
 
-@app.post("/run/daily")
-async def run_daily(authorization: Optional[str] = Header(None)):
-    _check_auth(authorization)
-    return {"status": "ok"}
-
 @app.post("/resume")
 async def resume(request: Request):
-    import boto3  # ensure available when approve path runs
+    import boto3
+    from urllib.parse import parse_qs
 
     raw = await request.body()
-    print("[resume] hit; raw_len=", len(raw))
+    print("[resume] hit; len=", len(raw))
 
-    # Slack initial URL save ping (empty body) — always ack
+    # Slack initial URL check: empty body → must return 200 fast
     if not raw:
-        print("[resume] empty body -> ack for Slack URL save")
+        print("[resume] empty body -> ack")
         return {"ok": True}
 
-    # Signature verify (set SLACK_VERIFY=off to bypass during testing)
+    # Verify Slack signature (unless disabled explicitly)
     if os.getenv("SLACK_VERIFY", "on").lower() == "on":
-        if slk is None:
-            print("[resume] ERROR: slack verifier not available")
-            raise HTTPException(status_code=500, detail="Slack verifier not available")
         try:
             slk.verify_signature(request.headers, raw)
-        except Exception as e:
-            print("[resume] signature verify FAILED:", e)
+        } except Exception as e:
+            print("[resume] verify FAILED:", e)
             raise HTTPException(status_code=401, detail=f"Slack verify failed: {e}")
     else:
-        print("[resume] WARNING: SLACK_VERIFY=off (skipping signature check)")
+        print("[resume] SLACK_VERIFY=off (skipping signature)")
 
-    # Parse Slack payload
+    # --- Parse payload without python-multipart ---
+    payload: dict = {}
     try:
-        form = await request.form()
-        payload_txt = form.get("payload", "{}")
-        print("[resume] payload snippet:", (payload_txt[:200] + ("…"
-              if len(payload_txt) > 200 else "")))
-        payload = json.loads(payload_txt)
+        ct = request.headers.get("content-type", "")
+        if "application/json" in ct.lower():
+            payload = await request.json()
+        else:
+            form = parse_qs(raw.decode("utf-8", errors="ignore"))
+            p = form.get("payload", [None])[0]
+            if not p:
+                print("[resume] no 'payload' field in form; keys:", list(form.keys()))
+                return {"ok": True}
+            payload = json.loads(p)
     except Exception as e:
         print("[resume] payload parse error:", e)
         return {"ok": True}
 
-    ptype = payload.get("type")
-    print("[resume] payload.type =", ptype)
+    print("[resume] type =", payload.get("type"))
 
-    # ===== Block actions (buttons) =====
-    if ptype == "block_actions":
-        actions = payload.get("actions") or []
-        print("[resume] actions.count =", len(actions))
-        action = actions[0] if actions else {}
-        if action:
-            # Do not log full value (may be long); show short preview
-            val = action.get("value")
-            print("[resume] first action.id =", action.get("action_id"),
-                  " value_snippet=", (val[:120] + "…") if isinstance(val, str) and len(val) > 120 else val)
+    # ---- Common DDB helpers ----
+    region = os.getenv("AWS_REGION", "us-east-1")
+    table  = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
+    ddb    = boto3.client("dynamodb", region_name=region)
 
-        # Parse embedded JSON value (our button value)
+    def _S(item, key, default=""):
+        v = item.get(key)
+        return v.get("S") if isinstance(v, dict) and isinstance(v.get("S"), str) else default
+
+    def _L(item, key):
+        L = item.get(key, {}).get("L")
+        if not L: return []
+        return [ (x.get("S") if isinstance(x, dict) else str(x)) for x in L ]
+
+    # ---- Handle block actions (buttons) ----
+    if payload.get("type") == "block_actions":
+        acts = payload.get("actions") or []
+        print("[resume] actions.count =", len(acts))
+        act = acts[0] if acts else {}
+        # Parse the tiny JSON we stuffed into the button's `value`
+        data = {}
         try:
-            data = json.loads(action.get("value", "{}")) if isinstance(action.get("value"), str) else {}
+            if isinstance(act.get("value"), str):
+                data = json.loads(act["value"])
         except Exception as e:
-            print("[resume] json.loads(action.value) failed:", e)
-            data = {}
-
-        # Fallback: infer choice from action_id
-        action_id = (action.get("action_id") or "").lower()
+            print("[resume] act.value parse fail:", e)
+        # Fallback to action_id suffix -> A/B/C
+        aid = (act.get("action_id") or "").lower()
         if "choice" not in data:
-            if action_id.endswith("_a"):
-                data["choice"] = "A"
-            elif action_id.endswith("_b"):
-                data["choice"] = "B"
-            elif action_id.endswith("_c"):
-                data["choice"] = "C"
+            if aid.endswith("_a"): data["choice"] = "A"
+            elif aid.endswith("_b"): data["choice"] = "B"
+            elif aid.endswith("_c"): data["choice"] = "C"
+        print("[resume] data =", data)
 
-        print("[resume] parsed data =", data)
-
-        # Handle edit → open modal
+        # EDIT → open modal
         if data.get("action") == "edit":
-            if slk is None or storage is None:
-                print("[resume] EDIT: missing slk/storage, skipping modal open")
-                return {"response_action": "clear"}
-            trigger_id = payload.get("trigger_id")
-            art_id = data.get("article_id", "")
-            current = (storage.getArticle(art_id) if storage else {}) or {}
-            cur_title = current.get("title", "")
-            print(f"[resume] EDIT: article_id={art_id} current_title='{cur_title[:80]}'")
+            art_id = data.get("article_id") or ""
+            cur = {}
             try:
-                await slk.open_edit_modal(trigger_id, art_id, cur_title)
+                got = ddb.get_item(TableName=table, Key={"article_id": {"S": art_id}}).get("Item", {})
+                cur = {"title": _S(got, "title", "")}
             except Exception as e:
-                print("[resume] EDIT: open_edit_modal error:", e)
+                print("[resume] DDB get_item error:", e)
+            trig = payload.get("trigger_id")
+            try:
+                await slk.open_edit_modal(trig, art_id, cur.get("title", ""))
+            except Exception as e:
+                print("[resume] views.open error:", e)
             return {"response_action": "clear"}
 
-        # Handle approve → update DynamoDB directly
+        # APPROVE → update DDB
         if data.get("action") == "approve":
-            art_id = data.get("article_id")
+            art_id = data.get("id") or data.get("article_id")
             choice = (data.get("choice") or "A").upper()
-            print(f"[resume] APPROVE: article_id={art_id} choice={choice}")
+            print(f"[resume] APPROVE id={art_id} choice={choice}")
             if not art_id:
-                print("[resume] APPROVE: missing article_id in action data")
-                return {"text": "Unable to identify article_id from action."}
-
-            region = os.getenv("AWS_REGION", "us-east-1")
-            table  = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
-            ddb    = boto3.client("dynamodb", region_name=region)
-            print(f"[resume] APPROVE: DDB table={table} region={region}")
+                print("[resume] missing article_id in data")
+                return {"text": "Unable to identify article."}
 
             try:
-                got = ddb.get_item(
-                    TableName=table, Key={"article_id": {"S": art_id}}
-                ).get("Item")
-                if not got:
-                    print(f"[resume] APPROVE: DDB get_item returned empty for id={art_id}")
+                item = ddb.get_item(TableName=table, Key={"article_id": {"S": art_id}}).get("Item")
+                if not item:
+                    print(f"[resume] not found: {art_id}")
                     return {"text": "Article not found."}
 
-                # tiny unmarshallers
-                def _S(item, key, default=""):
-                    v = item.get(key)
-                    return v.get("S") if isinstance(v, dict) and isinstance(v.get("S"), str) else default
-                def _L(item, key):
-                    v = item.get("L") if isinstance(item.get(key), dict) else None
-                    if v is None:
-                        v = item.get(key, {}).get("L")
-                    if not v:
-                        return []
-                    return [ (x.get("S") if isinstance(x, dict) else str(x)) for x in v ]
+                titles = _L(item, "proposed_titles")
+                idx    = {"A":0,"B":1,"C":2}.get(choice, 0)
+                new_title = (titles[idx] if idx < len(titles) and titles[idx] else _S(item, "title")).strip()[:60]
+                if not new_title:
+                    new_title = "Approved title"
 
-                proposed       = (got.get("proposed_titles", {}).get("L") and
-                                   [x.get("S") for x in got["proposed_titles"]["L"]] ) or []
-                current_title  = _S(got, "title", "")
-                idx_map        = {"A": 0, "B": 1, "C": 2}
-                idx            = idx_map.get(choice, 0)
-                approved_title = (proposed[idx] if len(proposed) > idx and proposed[idx] else current_title)[:60]
-                if not approved_title:
-                    approved_title = "Approved title"
+                print(f"[resume] updating {art_id} -> '{new_title}' on table {table}")
+                d = {
+                    "TableName": table,
+                    "Key": {"article_id": {"S": art_id}},
+                    "UpdateExpression": "SET #s = :s, approved_title = :t, title = :t",
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": {
+                        ":s": {"S": "approved"},
+                        ":t": {"S": new_title},
+                    },
+                }
+                ddb.update_item(**d)
 
-                print(f"[resume] APPROVE: updating id={art_id} -> '{approved_title}'")
+                # ask Slack to replace the original message so you see success inline
+                return {"response_action": "update", "text": f"✅ Approved: {new_title}"}
+
+            except Exception as e:
+                print("[resume] DDB update error:", e)
+                return {"text": f"Update failed: {e}"}
+
+        # other action
+        print("[resume] unhandled action -> ack")
+        return {"text": "OK"}
+
+    # ---- Handle modal submission ----
+    if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "edit_submit":
+        try:
+            meta = json.loads(payload["view"].get("private_metadata", "{}"))
+            art_id = meta.get("article_id", "")
+            new_title = (payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"] or "").strip()[:60]
+            print(f"[resume] EDIT_SUBMIT id={art_id} -> '{new_title}'")
+            if art_id and new_title:
                 ddb.update_item(
                     TableName=table,
                     Key={"article_id": {"S": art_id}},
@@ -169,59 +180,12 @@ async def resume(request: Request):
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
                         ":s": {"S": "approved"},
-                        ":t": {"S": approved_title},
+                        ":t": {"S": new_title},
                     },
                 )
-
-                # Ask Slack to replace the original message so you see it update immediately.
-                return {
-                    "response_action": "update",
-                    "text": f"✅ Approved: {approved_title}"
-                }
-
-            except Exception as e:
-                print("[resume] APPROVE: DDB update error:", e)
-                return {"text": f"Update failed: {e}"}
-
-        # Handle regenerate marker
-        if data.get("action") == "regen":
-            art_id = data.get("article_id")
-            print(f"[resume] REGEN requested for {art_id}")
-            if storage is not None and art_id:
-                try:
-                    storage.update_article(art_id, status="awaiting_approval", needs_regen=True)
-                except Exception as e:
-                    print("[resume] REGEN: storage.update_article error:", e)
-            return {"text": "🔁 Will regenerate titles soon."}
-
-        print("[resume] Unhandled block action payload:", data)
-        return {"text": "Unhandled action"}
-
-    # ===== Modal submission (view_submission)
-    if ptype == "view_submission" and payload.get("view", {}).get("callback_id") == "edit_submit":
-        try:
-            pm        = json.loads(payload["view"].get("private_metadata", "{}"))
-            art_id    = pm.get("article_id", "")
-            new_title = payload["view"]["state"]["values"]["title_blk"]["title_in"]["value"].strip()[:60]
-            print(f"[resume] EDIT_SUBMIT: id={art_id} -> '{new_title}'")
-
-            region = os.getenv("AWS_REGION", "us-east-1")
-            table  = os.getenv("ARTICLES_TABLE", "ai-gen-articles")
-            ddb    = boto3.client("dynamodb", region_name=region)
-
-            ddb.update_item(
-                TableName=table,
-                Key={"article_id": {"S": art_id}},
-                UpdateExpression="SET #s = :s, approved_title = :t, title = :t",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":s": {"S": "approved"},
-                    ":t": {"S": new_title},
-                },
-            )
         except Exception as e:
             print("[resume] EDIT_SUBMIT error:", e)
         return {"response_action": "clear"}
 
-    print("[resume] Non-action payload; ack")
+    print("[resume] non-interactive payload -> ack")
     return {"ok": True}
