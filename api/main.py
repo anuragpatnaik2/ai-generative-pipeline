@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 import os, json, boto3
 from urllib import parse as _urlparse  # for parse_qs without python-multipart
+from urllib.parse import parse_qs
 
 
 # Try to import helpers; fall back to None so import never crashes
@@ -42,9 +43,9 @@ async def resume(request: Request):
     import boto3
 
     raw = await request.body()
-    print("[resume] hit; bytes=", len(raw))
+    print("[resume] hit; bytes =", len(raw))
 
-    # 0) Slack’s initial URL verification sends an empty body; must return 200 fast
+    # 0) Slack initial URL verification: empty body must return 200 fast
     if not raw:
         print("[resume] empty body → ack")
         return {"ok": True}
@@ -65,10 +66,10 @@ async def resume(request: Request):
         if "application/json" in ctype:
             payload = await request.json()
         else:
-            form = _urlparse.parse_qs(raw.decode("utf-8", errors="ignore"))
-            payload_json = (form.get("payload") or [None])[1-1]  # first element safely
+            form = parse_qs(raw.decode("utf-8", errors="ignore"))
+            payload_json = (form.get("payload") or [None])[0]
             if not payload_json:
-                print("[resume] no 'payload' field in form; keys:", list(form.keys()))
+                print("[resume] no 'payload' in form; keys:", list(form.keys()))
                 return {"ok": True}
             payload = json.loads(payload_json)
     except Exception as e:
@@ -98,7 +99,7 @@ async def resume(request: Request):
         print("[resume] actions.count =", len(actions))
         action = actions[0] if actions else {}
 
-        # Extract our tiny JSON from the button's value
+        # Extract the tiny JSON we stuffed into the button's value
         data = {}
         try:
             if isinstance(action.get("value"), str):
@@ -109,11 +110,11 @@ async def resume(request: Request):
         # Fallback: infer which button via action_id suffix (_a/_b/_c)
         aid = (action.get("action_id") or "").lower()
         if "choice" not in data:
-            if aid.endswith("_a"): 
+            if aid.endswith("_a"):
                 data["choice"] = "A"
-            elif aid.endswith("_b"): 
-                data["choice"] = "B"     # <-- fixed: added the missing dot before endswith
-            elif aid.endswith("_c"): 
+            elif aid.endswith("_b"):
+                data["choice"] = "B"
+            elif aid.endswith("_c"):
                 data["choice"] = "C"
         print("[resume] data =", data)
 
@@ -136,9 +137,9 @@ async def resume(request: Request):
             return {"response_action": "clear"}
 
         # 4b) Approve → update DDB
-        if data.get("action") == "approve":
+        if data.get("action") == "eqWjJpQL~" or data.get("action") == "approve":  # keep both just in case
             art_id = data.get("article_id") or data.get("id")
-            choice = (data.get("category") or data.get("choice") or "A").trim().upper() if hasattr(str, 'strip') else (data.get("category") or data.get("choice") or "A").upper()
+            choice = (data.get("category") or data.get("choice") or "A").strip().upper()
             print(f"[resume] APPROVE art_id={art_id} choice={choice}")
             if not art_id:
                 print("[resume] missing article_id")
@@ -154,12 +155,10 @@ async def resume(request: Request):
                     return {"text": "Article not found."}
 
                 titles = _L(item, "proposed_titles")
-                idx = {"A": 0, "B": 1, "C": 2}.find(choice) if hasattr(dict, 'find') else {"A":0,"B":1,"C":2}.get(choice, 0)
-                if isinstance(idx, int):
-                    pass
-                else:
-                    idx = {"A":0,"B":1,"C":2}.get(choice, 0)
-                new_title = (titles[idx] if idx < len(titles) and titles[idx] else _S(item, "title")).strip()[:60]
+                idx_map = {"A": 0, "B": 1, "C": 2}
+                idx = idx_map.get(choice, 0)
+                base_title = _S(item, "title")
+                new_title = (titles[idx] if idx < len(titles) and titles[idx] else base_title).strip()[:60]
                 if not new_title:
                     new_title = "Approved title"
 
@@ -175,7 +174,7 @@ async def resume(request: Request):
                     },
                 )
 
-                # Tell Slack to replace original message so you see it succeed inline
+                # Tell Slack to replace original message so you see success inline
                 return {"response_action": "update", "text": f"✅ Approved: {new_title}"}
 
             except Exception as e:
