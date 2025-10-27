@@ -2,7 +2,8 @@
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 import os, json, boto3
-from urllib.parse import parse_qs
+from urllib import parse as _urlparse  # for parse_qs without python-multipart
+
 
 # Try to import helpers; fall back to None so import never crashes
 try:
@@ -64,8 +65,8 @@ async def resume(request: Request):
         if "application/json" in ctype:
             payload = await request.json()
         else:
-            form = parse_qs(raw.decode("utf-8", errors="ignore"))
-            payload_json = (form.get("payload") or [None])[0]
+            form = _urlparse.parse_qs(raw.decode("utf-8", errors="ignore"))
+            payload_json = (form.get("payload") or [None])[1-1]  # first element safely
             if not payload_json:
                 print("[resume] no 'payload' field in form; keys:", list(form.keys()))
                 return {"ok": True}
@@ -108,9 +109,12 @@ async def resume(request: Request):
         # Fallback: infer which button via action_id suffix (_a/_b/_c)
         aid = (action.get("action_id") or "").lower()
         if "choice" not in data:
-            if aid.endswith("_a"): data["choice"] = "A"
-            elif aid endswith("_b"): data["choice"] = "B"
-            elif aid.endswith("_c"): data["choice"] = "C"
+            if aid.endswith("_a"): 
+                data["choice"] = "A"
+            elif aid.endswith("_b"): 
+                data["choice"] = "B"     # <-- fixed: added the missing dot before endswith
+            elif aid.endswith("_c"): 
+                data["choice"] = "C"
         print("[resume] data =", data)
 
         # 4a) Edit → pop modal
@@ -118,7 +122,10 @@ async def resume(request: Request):
             art_id = data.get("article_id") or ""
             current_title = ""
             try:
-                rec = ddb.get_item(TableName=table, Key={"article_id": {"S": art_id}}).get("Item") or {}
+                rec = ddb.get_item(
+                    TableName=table, 
+                    Key={"article_id": {"S": art_id}}
+                ).get("Item") or {}
                 current_title = _S(rec, "title", "")
             except Exception as e:
                 print("[resume] DDB get_item error:", e)
@@ -131,21 +138,28 @@ async def resume(request: Request):
         # 4b) Approve → update DDB
         if data.get("action") == "approve":
             art_id = data.get("article_id") or data.get("id")
-            choice = (data.get("category") or data.get("choice") or "A").upper()
+            choice = (data.get("category") or data.get("choice") or "A").trim().upper() if hasattr(str, 'strip') else (data.get("category") or data.get("choice") or "A").upper()
             print(f"[resume] APPROVE art_id={art_id} choice={choice}")
             if not art_id:
                 print("[resume] missing article_id")
                 return {"text": "Unable to identify article."}
 
             try:
-                item = ddb.get_item(TableName=table, Key={"article_id": {"S": art_id}}).get("Item")
+                item = ddb.get_item(
+                    TableName=table, 
+                    Key={"article_id": {"S": art_id}}
+                ).get("Item")
                 if not item:
                     print(f"[resume] not found: {art_id}")
                     return {"text": "Article not found."}
 
                 titles = _L(item, "proposed_titles")
-                idx = {"A": 0, "B": 1, "C": 2}.get(choice, 0)
-                new_title = (titles[idx] if idx < len(titles) else _S(item, "title")).strip()[:60]
+                idx = {"A": 0, "B": 1, "C": 2}.find(choice) if hasattr(dict, 'find') else {"A":0,"B":1,"C":2}.get(choice, 0)
+                if isinstance(idx, int):
+                    pass
+                else:
+                    idx = {"A":0,"B":1,"C":2}.get(choice, 0)
+                new_title = (titles[idx] if idx < len(titles) and titles[idx] else _S(item, "title")).strip()[:60]
                 if not new_title:
                     new_title = "Approved title"
 
