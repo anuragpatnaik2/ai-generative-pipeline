@@ -3,3 +3,21 @@ __pycache__/
 .env
 *.pyc
 .DS_Store
+# Python/venv & cache
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# local build dirs
+.apprunner_build/
+# local scratch
+--data
+-H
+# editor/IDE
+.vscode/
+.idea/
+# env files
+.env

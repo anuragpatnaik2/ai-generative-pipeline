@@ -1,0 +1,3 @@
+Generate exactly 3 SEO-friendly title options (<=60 characters each) for this news article.
+Requirements: no clickbait words, use sentence case, clear subject, match the source facts.
+Output as a JSON array of strings.

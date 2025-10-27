@@ -1,0 +1,67 @@
+feeds:
+  - name: OpenAI Blog
+    homepage: https://openai.com/blog
+    domains: [openai.com]
+  - name: Anthropic
+    homepage: https://www.anthropic.com/news
+    domains: [anthropic.com]
+  - name: Google AI Blog
+    homepage: https://ai.googleblog.com
+    domains: [ai.googleblog.com, blog.google]
+  - name: Meta AI
+    homepage: https://ai.meta.com/blog
+    domains: [ai.meta.com]
+  - name: Microsoft Research
+    homepage: https://www.microsoft.com/research
+    domains: [microsoft.com]
+  - name: Hugging Face
+    homepage: https://huggingface.co/blog
+    domains: [huggingface.co]
+  - name: Stability AI
+    homepage: https://stability.ai/news
+    domains: [stability.ai]
+  - name: NVIDIA
+    homepage: https://blogs.nvidia.com
+    domains: [blogs.nvidia.com, developer.nvidia.com]
+  - name: AWS ML Blog
+    homepage: https://aws.amazon.com/blogs/machine-learning
+    domains: [aws.amazon.com]
+  - name: TechCrunch AI
+    homepage: https://techcrunch.com/tag/artificial-intelligence
+    domains: [techcrunch.com]
+  - name: VentureBeat AI
+    homepage: https://venturebeat.com/category/ai
+    domains: [venturebeat.com]
+  - name: MIT Tech Review AI
+    homepage: https://www.technologyreview.com/ai
+    domains: [technologyreview.com]
+  - name: The Verge AI
+    homepage: https://www.theverge.com/ai-artificial-intelligence
+    domains: [theverge.com]
+  - name: Ars Technica
+    homepage: https://arstechnica.com/information-technology
+    domains: [arstechnica.com]
+  - name: Bloomberg Tech
+    homepage: https://www.bloomberg.com/technology
+    domains: [bloomberg.com]
+
+apis:
+  newsapi:
+    enabled: true
+    query: '( "generative AI" OR generative OR LLM OR "large language model" OR "diffusion model" OR "multimodal" OR bedrock OR openai OR anthropic OR mistral OR gemini OR llama )'
+    domains: [openai.com, anthropic.com, ai.googleblog.com, ai.meta.com, microsoft.com, huggingface.co, stability.ai, blogs.nvidia.com, aws.amazon.com, techcrunch.com, venturebeat.com, technologyreview.com, theverge.com, arstechnica.com, bloomberg.com]
+    language: en
+    pageSize: 25
+  newscatcher:
+    enabled: true
+    lang: en
+  mediastack:
+    enabled: true
+    languages: en
+    categories: technology
+
+limits:
+  max_items_per_day: 6
+  freshness_hours: 72
+  min_title_length: 30
+  max_title_length: 120
